@@ -1,0 +1,417 @@
+# Create ScreenConnect User and Assign Computer
+
+conditions: 
+- name: 'client_filter' 
+  optMode: 'OptOut'
+  category: 'Rarity Solutions'
+  tags: 'Agents'
+
+- name: 'chat'
+  option_button: 'ScreenConnect'
+  option_text: 'Create User and Assign Computer'
+  option_category: 'Rarity Solutions'
+
+steps:
+# Capture Start Time
+- task: inline_powershell
+  alias: 'captureStartTime'
+  inputs:
+    script: |
+      $startTime = [DateTime]::UtcNow
+      Write-Host "Script start time: $($startTime.ToString('yyyy-MM-ddTHH:mm:ssZ'))"
+      return @{ startTime = $startTime }
+
+# Step 1: Get User Information
+- task: chat_interaction
+  alias: 'getUserInfo'
+  inputs:
+    text: 'Please provide the new user information:'
+    form_name: 'screenconnect_create_user'
+    form_display_mode: 'Embed'
+    form_def: |
+      {
+        "fields": [
+          {
+            "id": "sc_display_name",
+            "label": "Display Name",
+            "type": "text",
+            "required": true,
+            "placeholder": "Enter display name"
+          },
+          {
+            "id": "sc_email",
+            "label": "Email Address",
+            "type": "text",
+            "required": true,
+            "placeholder": "Enter email address"
+          },
+          {
+            "id": "sc_password",
+            "label": "Password",
+            "type": "password",
+            "required": true,
+            "placeholder": "Enter password"
+          }
+        ]
+      }
+
+# Step 2: Get Available Computers
+- task: inline_powershell
+  alias: 'getAvailableComputers'
+  skip: '{=!getUserInfo.success}'
+  inputs:
+    urlValue: $i_screenconnect_api_base_url_1
+    adminUser: $i_screenconnect_username_1
+    adminPass: $i_screenconnect_password_1
+    otpSecret: $i_screenconnect_otp_1
+    script: |
+      try {
+          Write-Host "Starting ScreenConnect operations..."
+          Write-Host "Server: $urlValue"
+
+          # Explicitly set SSL/TLS
+          [Net.ServicePointManager]::SecurityProtocol = [Net.SecurityProtocolType]::Tls12
+
+          # Create admin credentials
+          Write-Host "Creating admin credentials..."
+          $adminCred = New-Object -TypeName System.Management.Automation.PSCredential -ArgumentList $adminUser, (ConvertTo-SecureString -String $adminPass -AsPlainText -Force)
+
+          # Install API Module
+          Write-Host "Installing API Module..."
+          $documentsPath = [Environment]::GetFolderPath('MyDocuments')
+          $url = 'https://github.com/Rarity-Solutions/ConnectWiseControlAPI/archive/refs/heads/main.zip'
+          $moduleName = 'ConnectWiseControlAPI'
+          $modulePath = Join-Path $documentsPath 'WindowsPowerShell\Modules'
+          $tempPath = Join-Path $env:TEMP ($moduleName + '.zip')
+          
+          Invoke-WebRequest -Uri $url -OutFile $tempPath
+          $tempDir = '.' + $moduleName + '_temp'
+          $extractPath = Join-Path $HOME $tempDir
+          Expand-Archive -Path $tempPath -DestinationPath $extractPath -Force
+          $sourceFolder = Join-Path $extractPath ('ConnectWiseControlAPI-main/' + $moduleName)
+          $destinationFolder = Join-Path $modulePath $moduleName
+          
+          if (!(Test-Path $destinationFolder)) {
+              New-Item -Path $destinationFolder -ItemType Directory | Out-Null
+          }
+          
+          Copy-Item -Path "$sourceFolder\*" -Destination $destinationFolder -Recurse -Force
+          Remove-Item $tempPath, $extractPath -Recurse -Force
+
+          # Import the ConnectWise Control API module
+          Write-Host "Importing module..."
+          Import-Module $moduleName -Force
+
+          # Connect to the ConnectWise Control API
+          Write-Host "Connecting to ScreenConnect..."
+          Connect-CWC -Server $urlValue -Credentials $adminCred -Secret (ConvertTo-SecureString -String $otpSecret -AsPlainText -Force)
+
+          # Retrieve the list of machines/sessions
+          Write-Host "Getting session list..."
+          $sessions = Get-CWCSession -Type 'Access' | Sort-Object -Property Name
+          
+          Write-Host "Found $($sessions.Count) sessions"
+          
+          if ($null -eq $sessions -or $sessions.Count -eq 0) {
+              return @{ 
+                  success = $false; 
+                  error = "No computers found.";
+                  formDef = $(ConvertTo-Json -Compress @{ item = @() })
+              }
+          }
+          
+          $formDefProps = @{
+              item = @($sessions | ForEach-Object {
+                  @{
+                      text = "Computer: $($_.Name)"
+                      value = $_.SessionID
+                  }
+              })
+          }
+          
+          $formDefJson = ConvertTo-Json -Compress $formDefProps
+          return @{ 
+              success = $true; 
+              formDef = $formDefJson;
+              sessions = $sessions 
+          }
+      }
+      catch {
+          Write-Error "Error getting computer list: $_"
+          return @{ 
+              success = $false; 
+              error = "Failed to get computer list: $_";
+              formDef = $(ConvertTo-Json -Compress @{ item = @() })
+          }
+      }
+
+# Step 3: Select Computer
+- task: chat_interaction
+  alias: 'selectComputer'
+  skip: '{=!getAvailableComputers.success}'
+  inputs:
+    text: 'Select the computer to grant access to:'
+    form_name: 'form_select_one'
+    form_display_mode: 'Embed'
+    form_def: =getAvailableComputers.formDef
+
+# Step 4: Create User and Assign Access
+- task: inline_powershell
+  alias: 'createScreenConnectUser'
+  skip: '{=!selectComputer.success}'
+  inputs:
+    displayName: =getUserInfo.form.sc_display_name
+    email: =getUserInfo.form.sc_email
+    password: =getUserInfo.form.sc_password
+    selectedSessionId: =selectComputer.form.item
+    urlValue: $i_screenconnect_api_base_url_1
+    adminUser: $i_screenconnect_username_1
+    adminPass: $i_screenconnect_password_1
+    otpSecret: $i_screenconnect_otp_1
+    script: |
+      try {
+          Write-Host "Starting ScreenConnect operations..."
+          
+          # Explicitly set SSL/TLS
+          [Net.ServicePointManager]::SecurityProtocol = [Net.SecurityProtocolType]::Tls12
+
+          # Install API Module
+          Write-Host "Installing API Module..."
+          $documentsPath = [Environment]::GetFolderPath('MyDocuments')
+          $url = 'https://github.com/Rarity-Solutions/ConnectWiseControlAPI/archive/refs/heads/main.zip'
+          $moduleName = 'ConnectWiseControlAPI'
+          $modulePath = Join-Path $documentsPath 'WindowsPowerShell\Modules'
+          $tempPath = Join-Path $env:TEMP ($moduleName + '.zip')
+          
+          Invoke-WebRequest -Uri $url -OutFile $tempPath
+          $tempDir = '.' + $moduleName + '_temp'
+          $extractPath = Join-Path $HOME $tempDir
+          Expand-Archive -Path $tempPath -DestinationPath $extractPath -Force
+          $sourceFolder = Join-Path $extractPath ('ConnectWiseControlAPI-main/' + $moduleName)
+          $destinationFolder = Join-Path $modulePath $moduleName
+          
+          if (!(Test-Path $destinationFolder)) {
+              New-Item -Path $destinationFolder -ItemType Directory | Out-Null
+          }
+          
+          Copy-Item -Path "$sourceFolder\*" -Destination $destinationFolder -Recurse -Force
+          Remove-Item $tempPath, $extractPath -Recurse -Force
+
+          # Import the module
+          Write-Host "Importing module..."
+          Import-Module $moduleName -Force
+          
+          # Create admin credentials
+          Write-Host "Creating credentials..."
+          $adminCred = New-Object -TypeName System.Management.Automation.PSCredential -ArgumentList $adminUser, (ConvertTo-SecureString -String $adminPass -AsPlainText -Force)
+          
+          # Create new user credentials
+          $userSecurePass = ConvertTo-SecureString $password -AsPlainText -Force
+          $userCred = New-Object System.Management.Automation.PSCredential ($email, $userSecurePass)
+          
+          # Connect to ScreenConnect
+          Write-Host "Connecting to ScreenConnect..."
+          Connect-CWC -Server $urlValue -Credentials $adminCred -Secret (ConvertTo-SecureString -String $otpSecret -AsPlainText -Force)
+          
+          # Get the computer name for the selected session
+          $selectedSession = Get-CWCSession -Type 'Access' | Where-Object { $_.SessionID -eq $selectedSessionId }
+          $computerName = $selectedSession.Name
+          
+          # Create new user
+          Write-Host "Creating new user..."
+          $newUserParams = @{
+              Credentials = $userCred
+              Email = $email
+              DisplayName = $displayName
+              OTP = 'email'
+              SecurityGroups = 'Remote Workforce'
+          }
+          New-CWCUser @newUserParams
+          
+          # Create assignment
+          Write-Host "Creating assignment..."
+          $assignParams = @{
+              SessionID = $selectedSessionId
+              UserName = $email
+              DisplayName = $displayName
+          }
+          New-CWCRemoteWorkforceAssignment @assignParams
+          
+          return @{ 
+              success = $true; 
+              message = "User created and assigned successfully to computer: $computerName";
+              computerName = $computerName
+          }
+      }
+      catch {
+          Write-Error "Error in ScreenConnect operations: $_"
+          return @{ 
+              success = $false; 
+              error = "Failed to complete ScreenConnect operations: $_"
+          }
+      }
+
+# Display Results
+- task: chat_interaction
+  alias: 'displayResults'
+  inputs:
+    text: =createScreenConnectUser.message
+    form_display_mode: 'Embed'
+
+# Add an audit log message
+- task: system_audit_note
+  inputs:
+    Content: |
+      ScreenConnect User Creation Results:
+      Display Name: {=getUserInfo.form.sc_display_name}
+      Email: {=getUserInfo.form.sc_email}
+      Computer Name: {=createScreenConnectUser.computerName}
+      Status: {=createScreenConnectUser.message}
+
+# Task to retrieve the ConnectWise member by email
+- task: inline_powershell
+  alias: 'get_cw_member_by_email'
+  inputs:
+    CW_Api_Url: $CW_Api_Url
+    CW_Api_Token: $CW_Api_Token
+    CW_Api_Client_Id: $CW_Api_Client_Id
+    email: $Pia_Chat_User_Email
+    script: |
+      Function GetMemberByEmail($email)
+      {
+          $url = "$CW_Api_Url/apis/3.0/system/members?conditions=primaryEmail='$email'"
+          Write-Host "Requesting URL: $url"
+
+          $request = [System.Net.HttpWebRequest]::Create($url)
+          $request.Method = "GET"
+          $request.ContentType = "application/json"
+          $authBytes = [System.Text.Encoding]::UTF8.GetBytes($CW_Api_Token)
+          $request.Headers["Authorization"] = "Basic " + [Convert]::ToBase64String($authBytes)
+          $request.Headers["clientId"] = $CW_Api_Client_Id
+
+          try {
+              $response = $request.GetResponse()
+              $reader = New-Object System.IO.StreamReader($response.GetResponseStream())
+              $jsonResult = $reader.ReadToEnd()
+              $response.Dispose()
+              return (ConvertFrom-Json $jsonResult)
+          }
+          catch {
+              Write-Error "Error in GetMemberByEmail: $_"
+              return $null
+          }
+      }
+
+      $memberObj = GetMemberByEmail -email $email | Select-Object -First 1
+      if ($null -eq $memberObj) {
+          Write-Error "Failed to retrieve member."
+          return @{ success = $false; error = "Failed to retrieve member." }
+      }
+      return @{ success = $true; MemberId = $memberObj.Id }
+
+# Task to create the time log entry
+- task: inline_powershell
+  alias: 'create_time_log'
+  inputs:
+    CW_Api_Url: $CW_Api_Url
+    CW_Api_Token: $CW_Api_Token
+    CW_Api_Client_Id: $CW_Api_Client_Id
+    ticketId: $Ctx_Ticket_Id
+    memberId: =get_cw_member_by_email.MemberId
+    startTime: =captureStartTime.startTime
+    script: |
+      Function CreateTimeLog($timeLogData)
+      {
+          $url = "$CW_Api_Url/apis/3.0/time/entries"
+          Write-Host "Creating time log at URL: $url"
+  
+          $request = [System.Net.HttpWebRequest]::Create($url)
+          $request.Method = "POST"
+          $request.ContentType = "application/json"
+          $authBytes = [System.Text.Encoding]::UTF8.GetBytes($CW_Api_Token)
+          $request.Headers["Authorization"] = "Basic " + [Convert]::ToBase64String($authBytes)
+          $request.Headers["clientId"] = $CW_Api_Client_Id
+          
+          $body = ConvertTo-Json -InputObject $timeLogData -Depth 5
+          Write-Host "Request body: $body"
+
+          try {
+              $requestWriter = New-Object System.IO.StreamWriter $request.GetRequestStream()
+              $requestWriter.Write($body)
+              $requestWriter.Flush()
+              $requestWriter.Close()
+
+              $response = $request.GetResponse()
+              $reader = New-Object System.IO.StreamReader($response.GetResponseStream())
+              $result = $reader.ReadToEnd()
+              $response.Dispose()
+              Write-Host "Time log result: $result"
+              return @{ success = $true; result = $result }
+          }
+          catch [System.Net.WebException] {
+              $respStream = $_.Exception.Response.GetResponseStream()
+              $reader = New-Object System.IO.StreamReader($respStream)
+              $errorMsg = $reader.ReadToEnd()
+              Write-Error "Failed to create time log: $errorMsg"
+              return @{ success = $false; error = "Failed to create time log: $errorMsg" }
+          }
+      }
+
+      try {
+          Write-Host "Start time received: $startTime"
+          
+          # Parse the start time
+          if ($startTime -is [DateTime]) {
+              $timeStart = $startTime
+          } elseif ($startTime -is [string]) {
+              $timeStart = [DateTime]::Parse($startTime, [System.Globalization.CultureInfo]::InvariantCulture, [System.Globalization.DateTimeStyles]::AdjustToUniversal)
+          } else {
+              throw "Invalid start time type: $($startTime.GetType())"
+          }
+          
+          Write-Host "Parsed start time: $timeStart"
+          
+          # Capture end time and ensure it's at least one minute after start time
+          $timeEnd = [DateTime]::UtcNow
+          $timeDiff = $timeEnd - $timeStart
+          
+          # If time difference is less than 1 minute, adjust end time
+          if ($timeDiff.TotalMinutes -lt 1) {
+              $timeEnd = $timeStart.AddMinutes(1)
+          }
+
+          # Calculate final time difference and round up
+          $timeDiff = $timeEnd - $timeStart
+          $timeDiffMinutes = [math]::Ceiling($timeDiff.TotalMinutes)
+
+          Write-Host "Time difference in minutes (rounded up): $timeDiffMinutes minutes."
+
+          $timeLogData = @{
+              member = @{ id = [int]$memberId }
+              chargeToId = [int]$ticketId
+              timeStart = $timeStart.ToString("yyyy-MM-ddTHH:mm:ssZ")
+              timeEnd = $timeEnd.ToString("yyyy-MM-ddTHH:mm:ssZ")
+              notes = "Time spent on ScreenConnect user creation and access assignment. Total time: $timeDiffMinutes minutes."
+              billableOption = "Billable"
+              workType = @{ name = "Remote Help Desk" }
+              workRole = @{ name = "Technician" }
+              chargeToType = "ServiceTicket"
+          }
+
+          $result = CreateTimeLog -timeLogData $timeLogData
+          if ($result.success) {
+              return @{ success = $true; result = $result.result; timeDiffMinutes = $timeDiffMinutes }
+          } else {
+              return @{ success = $false; error = $result.error; timeDiffMinutes = $timeDiffMinutes }
+          }
+      }
+      catch {
+          Write-Error "Error in create_time_log: $_"
+          return @{ success = $false; error = "Error in create_time_log: $_"; timeDiffMinutes = 0 }
+      }
+
+# Add an audit log message about the time entry
+- task: system_audit_note
+  inputs:
+    Content: |
+      Time entry logged: {=create_time_log.timeDiffMinutes} minutes.
